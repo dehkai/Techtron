@@ -1,8 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const receiptRoutes = require('./routes/receiptRoutes');
-const taxRoutes = require('./routes/taxRoutes');
-const aiRoutes = require('./routes/aiRoutes');
+
+const bankStatementRoutes = require('./routes/bankStatementRoutes');
 
 const app = express();
 
@@ -12,9 +11,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Routes
-app.use('/api/receipts', receiptRoutes);
-app.use('/api/tax', taxRoutes);
-app.use('/api/ai', aiRoutes);
+app.use('/api/bank-statements', bankStatementRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
