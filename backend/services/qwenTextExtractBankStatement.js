@@ -1,13 +1,23 @@
 const mysql = require('mysql');
 const fs = require('fs');
+const OpenAI = require('openai');
 
-// Create a connection to Alibaba Cloud SQL Database
-const db = mysql.createConnection({
-    host: process.env.DB_HOST || 'your-alibaba-cloud-host',
-    user: process.env.DB_USER || 'your-username',
-    password: process.env.DB_PASSWORD || 'your-password',
-    database: process.env.DB_NAME || 'your-database',
+// Create OpenAI client
+const openai = new OpenAI({
+    apiKey: process.env.QWEN_API_KEY,
+    baseURL: process.env.QWEN_API_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
 });
+
+// Create a connection to Alibaba Cloud SQL Database only if DB_HOST is configured
+let db;
+if (process.env.DB_HOST) {
+    db = mysql.createConnection({
+        host: process.env.DB_HOST,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        database: process.env.DB_NAME,
+    });
+}
 
 /**
  * Standardizes date format to YYYY-MM-DD
@@ -48,14 +58,17 @@ function standardizeDate(dateStr) {
  * @returns {Object} - {type: 'credit'|'debit', amount: number}
  */
 function determineTransactionType(amount) {
+    // Convert amount to string if it's a number
+    const amountStr = amount?.toString() || '0';
+    
     // Remove currency symbols and commas
-    let cleanAmount = amount.replace(/[^0-9.-]/g, '');
+    let cleanAmount = amountStr.replace(/[^0-9.-]/g, '');
     
     // Check for explicit credit/debit indicators
-    if (amount.toLowerCase().includes('cr') || amount.toLowerCase().includes('credit')) {
+    if (amountStr.toLowerCase().includes('cr') || amountStr.toLowerCase().includes('credit')) {
         return { type: 'credit', amount: Math.abs(parseFloat(cleanAmount)) };
     }
-    if (amount.toLowerCase().includes('dr') || amount.toLowerCase().includes('debit')) {
+    if (amountStr.toLowerCase().includes('dr') || amountStr.toLowerCase().includes('debit')) {
         return { type: 'debit', amount: Math.abs(parseFloat(cleanAmount)) };
     }
     
@@ -76,50 +89,117 @@ function determineTransactionType(amount) {
  * @returns {string} - Structured prompt for the model
  */
 function generateExtractionPrompt() {
-    return `Please analyze this bank statement image and extract transaction information. The statement may be in various formats:
+    return `You are a specialized bank statement analyzer. Your task is to extract transaction information from bank statements and return it in a structured JSON format. Follow these detailed instructions:
 
-1. Date Formats to Handle:
-   - DD/MM/YYYY (e.g., 25/12/2023)
-   - MM/DD/YYYY (e.g., 12/25/2023)
-   - DD/MM/YY (e.g., 25/12/23)
-   - MM/YY (e.g., 12/23)
-   - YYYY-MM-DD (e.g., 2023-12-25)
+1. INPUT: You will receive a bank statement image. Analyze it carefully and extract all transaction information.
 
-2. Amount Formats to Handle:
-   - Separate credit/debit columns
-   - Amounts with +/- signs (e.g., +1000.00 or -500.00 or 1000.00+ or 500.00-)
-   - Amounts with CR/DR indicators
-   - Amounts with currency symbols and commas
-   - Amounts in parentheses (e.g., (500.00))
-
-3. For each transaction, identify:
-   - Date (convert to YYYY-MM-DD format)
-   - Transaction type (credit or debit)
-   - Description (transaction details)
-   - Amount (numeric value only)
-
-4. Important guidelines:
-   - Skip any header/footer information
-   - Focus only on actual transactions
+2. DATE HANDLING:
+   - Convert all dates to YYYY-MM-DD format
+   - Handle these date formats:
+     * DD/MM/YYYY (e.g., 25/12/2023)
+     * MM/DD/YYYY (e.g., 12/25/2023)
+     * DD/MM/YY (e.g., 25/12/23)
+     * MM/YY (e.g., 12/23)
+     * YYYY-MM-DD (e.g., 2023-12-25)
+     * DD-MM-YYYY (e.g., 25-12-2023)
+     * DD.MM.YYYY (e.g., 25.12.2023)
    - For MM/YY format, use the first day of the month
-   - Remove all currency symbols and commas from amounts
-   - Determine transaction type based on:
-     * Explicit CR/DR indicators
-     * +/- signs
-     * Separate credit/debit columns
-   - Preserve the exact transaction description text
-   - If transaction type is unclear, mark as 'unknown'
+   - Validate dates for correctness
 
-5. Output format:
-   Each transaction should be structured as:
-   {
-     "date": "YYYY-MM-DD",
-     "type": "credit/debit/unknown",
-     "description": "transaction details",
-     "amount": numeric_value
-   }
+3. TRANSACTION TYPE IDENTIFICATION:
+   A. Single Column Format:
+      - Positive amounts (+) or no sign = credit/deposit
+      - Negative amounts (-) = debit/withdrawal
+      - Amounts in parentheses () = debit/withdrawal
+      - Amounts with CR/credit/deposit = credit
+      - Amounts with DR/debit/withdraw = debit
+   
+   B. Two Column Format:
+      - Credit/Deposit column = credit
+      - Debit/Withdrawal column = debit
+      - Withdrawal/Deposit columns
+      - In/Out columns
+      - Plus/Minus columns
 
-Please ensure high accuracy in the extraction and maintain the chronological order of transactions. If you're unsure about any field, mark it as 'unknown' rather than making assumptions.`;
+4. AMOUNT PROCESSING:
+   - Remove all currency symbols ($, RM, €, £)
+   - Remove thousand separators (commas)
+   - Convert to numeric values
+   - Always format to 2 decimal places
+   - Handle these formats:
+     * With currency symbols (e.g., $1,000.00)
+     * With thousand separators (e.g., 1,000.00)
+     * With decimal points or commas (e.g., 1000.00 or 1000,00)
+     * With or without leading zeros
+     * In parentheses for debits (e.g., (500.00))
+
+5. TRANSACTION CATEGORIES:
+   A. Credits/Deposits:
+      - Salary/Income
+      - Transfers In
+      - Refunds
+      - Interest Earned
+      - Deposits
+      - Payments Received
+   
+   B. Debits/Withdrawals:
+      - ATM Withdrawals
+      - Purchases
+      - Transfers Out
+      - Fees/Charges
+      - Bill Payments
+      - Withdrawals
+
+6. EXTRACTION RULES:
+   - Skip header/footer information
+   - Focus only on actual transactions
+   - Preserve exact transaction descriptions
+   - Mark unclear transaction types as 'unknown'
+   - Consider statement layout and structure
+   - Look for transaction type indicators in:
+     * Column headers
+     * Individual entries
+     * Amount signs
+     * Parentheses
+     * Explicit indicators
+
+7. OUTPUT FORMAT:
+   Return a JSON array with this exact structure:
+   [
+     {
+       "date": "YYYY-MM-DD",
+       "type": "credit/debit/unknown",
+       "description": "transaction details",
+       "amount": numeric_value
+     }
+   ]
+
+8. VALIDATION RULES:
+   - Dates must be in YYYY-MM-DD format
+   - Amounts must be numeric with 2 decimal places
+   - Transaction types must be "credit", "debit", or "unknown"
+   - Descriptions must be non-empty strings
+   - No null or undefined values allowed
+   - No currency symbols in amounts
+   - No thousand separators in amounts
+
+9. ERROR HANDLING:
+   - If a date is invalid, use the first day of the month
+   - If an amount is invalid, use 0.00
+   - If a transaction type is unclear, mark as "unknown"
+   - If a description is missing, use "Unknown Transaction"
+
+10. IMPORTANT NOTES:
+    - Return ONLY the JSON array
+    - No additional text before or after the array
+    - Ensure all amounts have 2 decimal places
+    - Remove any non-transaction information
+    - Handle both single and double column formats
+    - Consider the entire statement context
+    - Validate all extracted data
+
+Remember: Your output must be a valid JSON array containing only transaction data. Each transaction must have a valid date, type, description, and amount.`;
+
 }
 
 /**
@@ -136,40 +216,102 @@ async function extractBankStatementData(imagePath) {
         // Generate the extraction prompt
         const extractionPrompt = generateExtractionPrompt();
 
-        // Make API request to Model Studio using fetch
-        const response = await fetch(process.env.QWEN_API_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${process.env.QWEN_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                image: base64Image,
-                modelType: 'bank-statement',
-                prompt: extractionPrompt,
-                parameters: {
-                    temperature: 0.1,
-                    max_tokens: 2000,
-                    top_p: 0.9,
-                    response_format: { type: "json_object" }
+        console.log('Sending request to Qwen API...');
+        
+        // Make API request using OpenAI SDK
+        const response = await openai.chat.completions.create({
+            model: 'qwen-vl-max',
+            messages: [
+                {
+                    role: 'system',
+                    content: [{ 
+                        type: 'text', 
+                        text: 'You are a specialized bank statement parser. Extract all transactions and return them as a raw JSON array. Do not use markdown formatting, code blocks, or any other text formatting. Return only the JSON array.' 
+                    }]
+                },
+                {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:image/jpeg;base64,${base64Image}`
+                            }
+                        },
+                        {
+                            type: 'text',
+                            text: extractionPrompt
+                        }
+                    ]
                 }
-            })
+            ],
+            parameters: {
+                temperature: 0.1,
+                max_tokens: 2000,
+                top_p: 0.9,
+                response_format: { type: "json_object" }
+            }
         });
 
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        console.log('Received response from Qwen API');
+        console.log('Raw response:', JSON.stringify(response, null, 2));
+
+        let extractedData;
+        try {
+            const content = response.choices[0].message.content;
+            console.log('API response content:', content);
+            
+            // Clean the content of any markdown formatting
+            const cleanContent = content.replace(/```json\n?|\n?```/g, '').trim();
+            console.log('Cleaned content:', cleanContent);
+            
+            // Try to parse the content as JSON
+            extractedData = JSON.parse(cleanContent);
+            console.log('Parsed JSON data:', JSON.stringify(extractedData, null, 2));
+            
+            // If it's not an array, wrap it in an array
+            if (!Array.isArray(extractedData)) {
+                console.log('Response is not an array, wrapping in array');
+                extractedData = [extractedData];
+            }
+            
+            // Ensure all amounts are strings
+            extractedData = extractedData.map(transaction => ({
+                ...transaction,
+                amount: transaction.amount?.toString() || '0'
+            }));
+
+            // Validate the data structure
+            if (extractedData.length === 0) {
+                console.log('Warning: No transactions extracted from the image');
+            } else {
+                console.log(`Successfully extracted ${extractedData.length} transactions`);
+            }
+
+            // Validate each transaction
+            extractedData.forEach((transaction, index) => {
+                if (!transaction.date || !transaction.description || !transaction.amount) {
+                    console.log(`Warning: Transaction ${index} is missing required fields:`, transaction);
+                }
+            });
+
+        } catch (parseError) {
+            console.error('Failed to parse API response:', response.choices[0].message.content);
+            console.error('Parse error:', parseError);
+            throw new Error('Invalid JSON response from API');
         }
 
-        const data = await response.json();
-        const extractedData = data.extractedText || [];
-
         // Post-process the extracted data
-        return extractedData.map(transaction => ({
+        const processedData = extractedData.map(transaction => ({
             ...transaction,
             date: standardizeDate(transaction.date),
             ...determineTransactionType(transaction.amount)
         }));
+
+        console.log('Final processed data:', JSON.stringify(processedData, null, 2));
+        return processedData;
     } catch (error) {
+        console.error('Error in extractBankStatementData:', error);
         throw new Error(`Error extracting bank statement data: ${error.message}`);
     }
 }
@@ -180,6 +322,11 @@ async function extractBankStatementData(imagePath) {
  * @returns {string} - JSON string of transformed data
  */
 function transformToJSON(extractedData) {
+    // If extractedData is already an array, return it as is
+    if (Array.isArray(extractedData)) {
+        return JSON.stringify(extractedData);
+    }
+
     const transactions = [];
 
     extractedData.forEach((item) => {
@@ -207,6 +354,13 @@ function transformToJSON(extractedData) {
  */
 function saveTransactionsToDatabase(jsonString) {
     return new Promise((resolve, reject) => {
+        // Skip database save if DB_HOST is not configured
+        if (!db) {
+            console.log('Database connection not configured, skipping save');
+            resolve();
+            return;
+        }
+
         const transactions = JSON.parse(jsonString);
 
         // Use parallel processing for better performance
@@ -253,7 +407,8 @@ async function processBankStatement(imagePath) {
         // Step 3: Save JSON data to the database
         await saveTransactionsToDatabase(jsonString);
         
-        return jsonString;
+        // Return the extracted data directly
+        return extractedData;
     } catch (error) {
         throw error;
     }
