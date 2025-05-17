@@ -80,8 +80,13 @@ function determineTransactionType(amount) {
         return { type: 'credit', amount: Math.abs(parseFloat(cleanAmount)) };
     }
     
-    // If amount is in separate credit/debit columns
-    return { type: 'unknown', amount: Math.abs(parseFloat(cleanAmount)) };
+    // If amount is in parentheses, it's a debit
+    if (amountStr.includes('(') && amountStr.includes(')')) {
+        return { type: 'debit', amount: Math.abs(parseFloat(cleanAmount)) };
+    }
+    
+    // If no indicators found, preserve the original type from parsed data
+    return { type: 'credit', amount: Math.abs(parseFloat(cleanAmount)) };
 }
 
 /**
@@ -89,117 +94,49 @@ function determineTransactionType(amount) {
  * @returns {string} - Structured prompt for the model
  */
 function generateExtractionPrompt() {
-    return `You are a specialized bank statement analyzer. Your task is to extract transaction information from bank statements and return it in a structured JSON format. Follow these detailed instructions:
+    return `Please analyze this bank statement image and extract transaction information. The statement may be in various formats:
 
-1. INPUT: You will receive a bank statement image. Analyze it carefully and extract all transaction information.
+1. Date Formats to Handle:
+   - DD/MM/YYYY (e.g., 25/12/2023)
+   - MM/DD/YYYY (e.g., 12/25/2023)
+   - DD/MM/YY (e.g., 25/12/23)
+   - MM/YY (e.g., 12/23)
+   - YYYY-MM-DD (e.g., 2023-12-25)
 
-2. DATE HANDLING:
-   - Convert all dates to YYYY-MM-DD format
-   - Handle these date formats:
-     * DD/MM/YYYY (e.g., 25/12/2023)
-     * MM/DD/YYYY (e.g., 12/25/2023)
-     * DD/MM/YY (e.g., 25/12/23)
-     * MM/YY (e.g., 12/23)
-     * YYYY-MM-DD (e.g., 2023-12-25)
-     * DD-MM-YYYY (e.g., 25-12-2023)
-     * DD.MM.YYYY (e.g., 25.12.2023)
-   - For MM/YY format, use the first day of the month
-   - Validate dates for correctness
+2. Amount Formats to Handle:
+   - Separate credit/debit columns
+   - Amounts with +/- signs (e.g., +1000.00 or -500.00 or 1000.00+ or 500.00-)
+   - Amounts with CR/DR indicators
+   - Amounts with currency symbols and commas
+   - Amounts in parentheses (e.g., (500.00))
 
-3. TRANSACTION TYPE IDENTIFICATION:
-   A. Single Column Format:
-      - Positive amounts (+) or no sign = credit/deposit
-      - Negative amounts (-) = debit/withdrawal
-      - Amounts in parentheses () = debit/withdrawal
-      - Amounts with CR/credit/deposit = credit
-      - Amounts with DR/debit/withdraw = debit
-   
-   B. Two Column Format:
-      - Credit/Deposit column = credit
-      - Debit/Withdrawal column = debit
-      - Withdrawal/Deposit columns
-      - In/Out columns
-      - Plus/Minus columns
+3. For each transaction, identify:
+   - Date (convert to YYYY-MM-DD format)
+   - Transaction type (credit or debit)
+   - Description (transaction details)
+   - Amount (numeric value only)
 
-4. AMOUNT PROCESSING:
-   - Remove all currency symbols ($, RM, €, £)
-   - Remove thousand separators (commas)
-   - Convert to numeric values
-   - Always format to 2 decimal places
-   - Handle these formats:
-     * With currency symbols (e.g., $1,000.00)
-     * With thousand separators (e.g., 1,000.00)
-     * With decimal points or commas (e.g., 1000.00 or 1000,00)
-     * With or without leading zeros
-     * In parentheses for debits (e.g., (500.00))
-
-5. TRANSACTION CATEGORIES:
-   A. Credits/Deposits:
-      - Salary/Income
-      - Transfers In
-      - Refunds
-      - Interest Earned
-      - Deposits
-      - Payments Received
-   
-   B. Debits/Withdrawals:
-      - ATM Withdrawals
-      - Purchases
-      - Transfers Out
-      - Fees/Charges
-      - Bill Payments
-      - Withdrawals
-
-6. EXTRACTION RULES:
-   - Skip header/footer information
+4. Important guidelines:
+   - Skip any header/footer information
    - Focus only on actual transactions
-   - Preserve exact transaction descriptions
-   - Mark unclear transaction types as 'unknown'
-   - Consider statement layout and structure
-   - Look for transaction type indicators in:
-     * Column headers
-     * Individual entries
-     * Amount signs
-     * Parentheses
-     * Explicit indicators
+   - For MM/YY format, use the first day of the month
+   - Remove all currency symbols and commas from amounts
+   - Determine transaction type based on:
+     * Explicit CR/DR indicators
+     * +/- signs
+     * Separate credit/debit columns
+   - Preserve the exact transaction description text
 
-7. OUTPUT FORMAT:
-   Return a JSON array with this exact structure:
-   [
-     {
-       "date": "YYYY-MM-DD",
-       "type": "credit/debit/unknown",
-       "description": "transaction details",
-       "amount": numeric_value
-     }
-   ]
+5. Output format:
+   Each transaction should be structured as:
+   {
+     "date": "YYYY-MM-DD",
+     "type": "credit/debit",
+     "description": "transaction details",
+     "amount": numeric_value
+   }
 
-8. VALIDATION RULES:
-   - Dates must be in YYYY-MM-DD format
-   - Amounts must be numeric with 2 decimal places
-   - Transaction types must be "credit", "debit", or "unknown"
-   - Descriptions must be non-empty strings
-   - No null or undefined values allowed
-   - No currency symbols in amounts
-   - No thousand separators in amounts
-
-9. ERROR HANDLING:
-   - If a date is invalid, use the first day of the month
-   - If an amount is invalid, use 0.00
-   - If a transaction type is unclear, mark as "unknown"
-   - If a description is missing, use "Unknown Transaction"
-
-10. IMPORTANT NOTES:
-    - Return ONLY the JSON array
-    - No additional text before or after the array
-    - Ensure all amounts have 2 decimal places
-    - Remove any non-transaction information
-    - Handle both single and double column formats
-    - Consider the entire statement context
-    - Validate all extracted data
-
-Remember: Your output must be a valid JSON array containing only transaction data. Each transaction must have a valid date, type, description, and amount.`;
-
+Please ensure high accuracy in the extraction and maintain the chronological order of transactions.`;
 }
 
 /**
@@ -302,11 +239,15 @@ async function extractBankStatementData(imagePath) {
         }
 
         // Post-process the extracted data
-        const processedData = extractedData.map(transaction => ({
-            ...transaction,
-            date: standardizeDate(transaction.date),
-            ...determineTransactionType(transaction.amount)
-        }));
+        const processedData = extractedData.map(transaction => {
+            const { type, amount } = determineTransactionType(transaction.amount);
+            return {
+                ...transaction,
+                date: standardizeDate(transaction.date),
+                type: transaction.type || type, // Preserve original type if available
+                amount: amount
+            };
+        });
 
         console.log('Final processed data:', JSON.stringify(processedData, null, 2));
         return processedData;
