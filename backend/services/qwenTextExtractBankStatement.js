@@ -1,13 +1,23 @@
 const mysql = require('mysql');
 const fs = require('fs');
+const OpenAI = require('openai');
 
-// Create a connection to Alibaba Cloud SQL Database
-const db = mysql.createConnection({
-    host: process.env.DB_HOST || 'your-alibaba-cloud-host',
-    user: process.env.DB_USER || 'your-username',
-    password: process.env.DB_PASSWORD || 'your-password',
-    database: process.env.DB_NAME || 'your-database',
+// Create OpenAI client
+const openai = new OpenAI({
+    apiKey: process.env.QWEN_API_KEY,
+    baseURL: process.env.QWEN_API_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
 });
+
+// Create a connection to Alibaba Cloud SQL Database only if DB_HOST is configured
+let db;
+if (process.env.DB_HOST) {
+    db = mysql.createConnection({
+        host: process.env.DB_HOST,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        database: process.env.DB_NAME,
+    });
+}
 
 /**
  * Standardizes date format to YYYY-MM-DD
@@ -48,14 +58,17 @@ function standardizeDate(dateStr) {
  * @returns {Object} - {type: 'credit'|'debit', amount: number}
  */
 function determineTransactionType(amount) {
+    // Convert amount to string if it's a number
+    const amountStr = amount?.toString() || '0';
+    
     // Remove currency symbols and commas
-    let cleanAmount = amount.replace(/[^0-9.-]/g, '');
+    let cleanAmount = amountStr.replace(/[^0-9.-]/g, '');
     
     // Check for explicit credit/debit indicators
-    if (amount.toLowerCase().includes('cr') || amount.toLowerCase().includes('credit')) {
+    if (amountStr.toLowerCase().includes('cr') || amountStr.toLowerCase().includes('credit')) {
         return { type: 'credit', amount: Math.abs(parseFloat(cleanAmount)) };
     }
-    if (amount.toLowerCase().includes('dr') || amount.toLowerCase().includes('debit')) {
+    if (amountStr.toLowerCase().includes('dr') || amountStr.toLowerCase().includes('debit')) {
         return { type: 'debit', amount: Math.abs(parseFloat(cleanAmount)) };
     }
     
@@ -67,8 +80,13 @@ function determineTransactionType(amount) {
         return { type: 'credit', amount: Math.abs(parseFloat(cleanAmount)) };
     }
     
-    // If amount is in separate credit/debit columns
-    return { type: 'unknown', amount: Math.abs(parseFloat(cleanAmount)) };
+    // If amount is in parentheses, it's a debit
+    if (amountStr.includes('(') && amountStr.includes(')')) {
+        return { type: 'debit', amount: Math.abs(parseFloat(cleanAmount)) };
+    }
+    
+    // If no indicators found, preserve the original type from parsed data
+    return { type: 'credit', amount: Math.abs(parseFloat(cleanAmount)) };
 }
 
 /**
@@ -108,18 +126,17 @@ function generateExtractionPrompt() {
      * +/- signs
      * Separate credit/debit columns
    - Preserve the exact transaction description text
-   - If transaction type is unclear, mark as 'unknown'
 
 5. Output format:
    Each transaction should be structured as:
    {
      "date": "YYYY-MM-DD",
-     "type": "credit/debit/unknown",
+     "type": "credit/debit",
      "description": "transaction details",
      "amount": numeric_value
    }
 
-Please ensure high accuracy in the extraction and maintain the chronological order of transactions. If you're unsure about any field, mark it as 'unknown' rather than making assumptions.`;
+Please ensure high accuracy in the extraction and maintain the chronological order of transactions.`;
 }
 
 /**
@@ -136,40 +153,106 @@ async function extractBankStatementData(imagePath) {
         // Generate the extraction prompt
         const extractionPrompt = generateExtractionPrompt();
 
-        // Make API request to Model Studio using fetch
-        const response = await fetch(process.env.QWEN_API_URL || 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${process.env.QWEN_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                image: base64Image,
-                modelType: 'bank-statement',
-                prompt: extractionPrompt,
-                parameters: {
-                    temperature: 0.1,
-                    max_tokens: 2000,
-                    top_p: 0.9,
-                    response_format: { type: "json_object" }
+        console.log('Sending request to Qwen API...');
+        
+        // Make API request using OpenAI SDK
+        const response = await openai.chat.completions.create({
+            model: 'qwen-vl-max',
+            messages: [
+                {
+                    role: 'system',
+                    content: [{ 
+                        type: 'text', 
+                        text: 'You are a specialized bank statement parser. Extract all transactions and return them as a raw JSON array. Do not use markdown formatting, code blocks, or any other text formatting. Return only the JSON array.' 
+                    }]
+                },
+                {
+                    role: 'user',
+                    content: [
+                        {
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:image/jpeg;base64,${base64Image}`
+                            }
+                        },
+                        {
+                            type: 'text',
+                            text: extractionPrompt
+                        }
+                    ]
                 }
-            })
+            ],
+            parameters: {
+                temperature: 0.1,
+                max_tokens: 2000,
+                top_p: 0.9,
+                response_format: { type: "json_object" }
+            }
         });
 
-        if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
+        console.log('Received response from Qwen API');
+        console.log('Raw response:', JSON.stringify(response, null, 2));
+
+        let extractedData;
+        try {
+            const content = response.choices[0].message.content;
+            console.log('API response content:', content);
+            
+            // Clean the content of any markdown formatting
+            const cleanContent = content.replace(/```json\n?|\n?```/g, '').trim();
+            console.log('Cleaned content:', cleanContent);
+            
+            // Try to parse the content as JSON
+            extractedData = JSON.parse(cleanContent);
+            console.log('Parsed JSON data:', JSON.stringify(extractedData, null, 2));
+            
+            // If it's not an array, wrap it in an array
+            if (!Array.isArray(extractedData)) {
+                console.log('Response is not an array, wrapping in array');
+                extractedData = [extractedData];
+            }
+            
+            // Ensure all amounts are strings
+            extractedData = extractedData.map(transaction => ({
+                ...transaction,
+                amount: transaction.amount?.toString() || '0'
+            }));
+
+            // Validate the data structure
+            if (extractedData.length === 0) {
+                console.log('Warning: No transactions extracted from the image');
+            } else {
+                console.log(`Successfully extracted ${extractedData.length} transactions`);
+            }
+
+            // Validate each transaction
+            extractedData.forEach((transaction, index) => {
+                if (!transaction.date || !transaction.description || !transaction.amount) {
+                    console.log(`Warning: Transaction ${index} is missing required fields:`, transaction);
+                }
+            });
+
+        } catch (parseError) {
+            console.error('Failed to parse API response:', response.choices[0].message.content);
+            console.error('Parse error:', parseError);
+            throw new Error('Invalid JSON response from API');
         }
 
-        const data = await response.json();
-        const extractedData = data.extractedText || [];
-
         // Post-process the extracted data
-        return extractedData.map(transaction => ({
-            ...transaction,
-            date: standardizeDate(transaction.date),
-            ...determineTransactionType(transaction.amount)
-        }));
+        const processedData = extractedData.map(transaction => {
+            const { type, amount } = determineTransactionType(transaction.amount);
+            return {
+                ...transaction,
+                date: standardizeDate(transaction.date),
+                type: transaction.type || type, // Preserve original type if available
+                amount: amount
+            };
+        });
+
+        console.log('Final processed data:', JSON.stringify(processedData, null, 2));
+        return processedData;
     } catch (error) {
+        console.error('Error in extractBankStatementData:', error);
         throw new Error(`Error extracting bank statement data: ${error.message}`);
     }
 }
@@ -180,6 +263,11 @@ async function extractBankStatementData(imagePath) {
  * @returns {string} - JSON string of transformed data
  */
 function transformToJSON(extractedData) {
+    // If extractedData is already an array, return it as is
+    if (Array.isArray(extractedData)) {
+        return JSON.stringify(extractedData);
+    }
+
     const transactions = [];
 
     extractedData.forEach((item) => {
@@ -207,6 +295,13 @@ function transformToJSON(extractedData) {
  */
 function saveTransactionsToDatabase(jsonString) {
     return new Promise((resolve, reject) => {
+        // Skip database save if DB_HOST is not configured
+        if (!db) {
+            console.log('Database connection not configured, skipping save');
+            resolve();
+            return;
+        }
+
         const transactions = JSON.parse(jsonString);
 
         // Use parallel processing for better performance
@@ -253,7 +348,8 @@ async function processBankStatement(imagePath) {
         // Step 3: Save JSON data to the database
         await saveTransactionsToDatabase(jsonString);
         
-        return jsonString;
+        // Return the extracted data directly
+        return extractedData;
     } catch (error) {
         throw error;
     }
