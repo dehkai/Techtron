@@ -31,15 +31,13 @@ const processBankStatementImage = async (req, res) => {
         fs.writeFileSync(filePath, req.file.buffer);
 
         // Process the bank statement
-        const result = await processBankStatement(filePath);
+        const extractedData = await processBankStatement(filePath);
 
         // Clean up the temporary file
         fs.unlinkSync(filePath);
 
-        res.json({
-            success: true,
-            data: result
-        });
+        // Return the extracted data directly
+        res.json(extractedData);
     } catch (error) {
         console.error('Error processing bank statement:', error);
         res.status(500).json({
